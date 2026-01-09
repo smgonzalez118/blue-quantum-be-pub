@@ -1,0 +1,36 @@
+# tickers_seed.txt
+# Formato: SIMBOLO,Nombre de la compañía
+# Comentarios (líneas que comienzan con #) y líneas vacías se ignoran.
+# Podés mezclar líneas sólo con símbolo (ej: AAPL) o símbolo+nombre (ej: AAPL,Apple Inc.).
+# Recomendación: mantener los símbolos en MAYÚSCULAS.
+
+AAPL,Apple Inc.
+MSFT,Microsoft Corporation
+NVDA,NVIDIA Corporation
+GOOGL,Alphabet Inc. (Class A)
+AMZN,Amazon.com, Inc.
+META,Meta Platforms, Inc.
+TSLA,Tesla, Inc.
+AMD,Advanced Micro Devices, Inc.
+ABNB,Airbnb, Inc.
+AVGO,Broadcom Inc.
+NFLX,Netflix, Inc.
+ORCL,Oracle Corporation
+INTC,Intel Corporation
+CRM,Salesforce, Inc.
+COST,Costco Wholesale Corporation
+PEP,PepsiCo, Inc.
+KO,The Coca-Cola Company
+WMT,Walmart Inc.
+DIS,The Walt Disney Company
+PYPL,PayPal Holdings, Inc.
+NKE,NIKE, Inc.
+ADBE,Adobe Inc.
+CSCO,Cisco Systems, Inc.
+QCOM,QUALCOMM Incorporated
+BAC,Bank of America Corporation
+XOM,Exxon Mobil Corporation
+CVX,Chevron Corporation
+UNH,UnitedHealth Group Incorporated
+ABBV,AbbVie Inc.
+T,AT&T Inc.

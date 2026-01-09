@@ -1,0 +1,21 @@
+# Entorno virtual
+venv/
+
+# Variables de entorno
+.env
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+
+# Archivos temporales de Django
+*.sqlite3
+
+# VS Code
+.vscode/
+
+# Node/Vite (si aplica)
+node_modules/
+dist/
+
+~$*.docx

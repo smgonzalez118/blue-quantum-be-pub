@@ -1,0 +1,412 @@
+name: Market nightly, weekly & monthly jobs (Render)
+
+on:
+  schedule:
+    - cron: "15 05 * * 2-6"   # Nightly (EOD del día previo)
+    - cron: "30 03 * * 2"     # Weekly fundamentals
+    - cron: "30 03 1 * *"     # Monthly profiles
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "nightly | fundamentals | profiles"
+        required: false
+        default: nightly
+      universe_list:
+        description: "Lista de universos (coma-separada): sp100,adrs,commodities,etfs"
+        required: false
+        default: sp100,adrs,commodities,etfs
+      metrics:
+        description: "Métricas (comma-separated) para fundamentals"
+        required: false
+        default: "eps,grossMargin,netMargin,operatingMargin,peTTM,roaTTM,roeTTM,roicTTM,fcfMargin,totalDebtToTotalAsset"
+      backfill_days:
+        description: "Cuántos días hábiles reponer (1..5) si no usás auto"
+        required: false
+        default: "1"
+      backfill_auto:
+        description: "¿Detectar huecos y reponer automáticamente? (true|false)"
+        required: true
+        default: "false"
+      backfill_mode:
+        description: "Modo auto: global|per_symbol"
+        required: true
+        default: "global"
+
+env:
+  BACKEND_BASE: ${{ secrets.BACKEND_BASE_URL }}
+  INTERNAL_API_TOKEN: ${{ secrets.INTERNAL_API_TOKEN }}
+
+  # Universos (o "global" si tu endpoint soporta ingest all con una sola llamada)
+  UNIVERSE_LIST: ${{ github.event.inputs.universe_list || 'sp100,adrs,commodities,etfs' }}
+
+  # Config backfill
+  BACKFILL_DAYS: ${{ github.event.inputs.backfill_days || '1' }}
+  BACKFILL_AUTO: ${{ github.event.inputs.backfill_auto || 'false' }}
+  BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'global' }}
+
+  # Pausas / reintentos
+  POLYGON_RPM: 5
+  SLEEP_BETWEEN_UNIVERSES: 13           # ya lo estabas usando
+  SLEEP_BETWEEN_STEPS: 20
+  PARTIAL_RETRIES: 15
+  # Nuevo: si lo dejás vacío, se calcula automático en helpers.sh (60/RPM + 1)
+  SLEEP_BETWEEN_RETRIES: ""
+  # Estrategia de ingestión: per_universe (default) | global_once (experimental)
+  INGEST_STRATEGY: per_universe
+
+  # Warmup / health
+  HEALTH_RETRIES: 12
+  HEALTH_SLEEP: 5
+
+jobs:
+  nightly_prices:
+    name: Nightly precios (update-last-candle → precalc → forecasts)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: market-nightly
+      cancel-in-progress: false
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '15 05 * * 2-6')
+      || (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'nightly' || github.event.inputs.task == ''))
+
+    steps:
+      - name: Contexto
+        shell: bash
+        run: |
+          echo "UTC now:" && date -u
+          echo "BACKEND_BASE=$BACKEND_BASE"
+          echo "UNIVERSE_LIST=$UNIVERSE_LIST"
+          echo "BACKFILL_AUTO=$BACKFILL_AUTO"
+          echo "BACKFILL_MODE=$BACKFILL_MODE"
+          echo "BACKFILL_DAYS=$BACKFILL_DAYS"
+          echo "POLYGON_RPM=$POLYGON_RPM"
+          echo "SLEEP_BETWEEN_UNIVERSES=$SLEEP_BETWEEN_UNIVERSES"
+          echo "SLEEP_BETWEEN_RETRIES=$SLEEP_BETWEEN_RETRIES"
+          echo "SLEEP_BETWEEN_STEPS=$SLEEP_BETWEEN_STEPS"
+          echo "PARTIAL_RETRIES=$PARTIAL_RETRIES"
+          echo "INGEST_STRATEGY=$INGEST_STRATEGY"
+
+      - name: Warm-up /healthz (con retries)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$BACKEND_BASE/internal/market/healthz"
+          echo "Warm-up: $URL"
+          for i in $(seq 1 "$HEALTH_RETRIES"); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -H "X-Internal-Token: $INTERNAL_API_TOKEN" "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "healthz OK"; break
+            fi
+            echo "healthz intento $i/$HEALTH_RETRIES → code=$code; sleep $HEALTH_SLEEP"
+            sleep "$HEALTH_SLEEP"
+            if [ "$i" = "$HEALTH_RETRIES" ]; then
+              echo "healthz no respondió 200. Continuo igual, pero puede fallar luego."
+            fi
+          done
+
+      - name: Helpers bash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > helpers.sh <<'BASH'
+          set -euo pipefail
+
+          # ===== Config sleeps seguros vs RPM =====
+          rpm=${POLYGON_RPM:-5}
+          calc_base_sleep () { echo $(( 60 / rpm + 1 )); }
+          base_sleep="$(calc_base_sleep)"
+          # Si SLEEP_BETWEEN_RETRIES está vacío, usar base_sleep
+          if [ -z "${SLEEP_BETWEEN_RETRIES:-}" ]; then
+            safe_retry_sleep="$base_sleep"
+          else
+            safe_retry_sleep="${SLEEP_BETWEEN_RETRIES}"
+          fi
+
+          jitter () { echo $(( RANDOM % $1 )); }
+
+          post_json () {
+            local url="$1"; local data="$2"
+            # capturamos body + http_code sin fallar el shell
+            local resp status body
+            resp="$(curl -sS -X POST "$url" \
+                     -H "Content-Type: application/json" \
+                     -H "X-Internal-Token: ${INTERNAL_API_TOKEN}" \
+                     --data "$data" \
+                     -w "\n%{http_code}")" || true
+            status="$(echo "$resp" | tail -n1)"
+            body="$(echo "$resp" | sed '$d')"
+            printf "%s\n---HTTP-STATUS---%s" "$body" "$status"
+          }
+
+          loop_until_not_partial () {
+            local url="$1"; local payload="$2"; local label="$3"
+            local i=1
+            while true; do
+              echo "===> [$label] intento $i/$PARTIAL_RETRIES"
+              out="$(post_json "$url" "$payload")"
+              status="$(echo "$out" | sed -n '$p' | sed 's/---HTTP-STATUS---//')"
+              body="$(echo "$out" | sed '$d')"
+              echo "$body"
+
+              # Si error servidor/429 → respetar ventana RPM antes de reintentar
+              if [ "$status" = "429" ] || [ "$status" = "500" ] || [ "$status" = "502" ] || [ "$status" = "503" ] || [ "$status" = "504" ]; then
+                if [ "$i" -lt "$PARTIAL_RETRIES" ]; then
+                  sleep_secs=$(( safe_retry_sleep + $(jitter 5) + 2 ))
+                  echo "HTTP $status → backoff $sleep_secs s y reintento..."
+                  sleep "$sleep_secs"; i=$((i+1)); continue
+                fi
+              fi
+
+              # Si la respuesta marca partial=true → backoff y reintentar
+              if echo "$body" | grep -Eq '"partial"[[:space:]]*:[[:space:]]*true'; then
+                if [ "$i" -lt "$PARTIAL_RETRIES" ]; then
+                  sleep_secs=$(( safe_retry_sleep + $(jitter 4) + 1 ))
+                  echo "Aún parcial → sleep $sleep_secs s y reintento..."
+                  sleep "$sleep_secs"; i=$((i+1)); continue
+                else
+                  echo "Máximo de reintentos parciales alcanzado ($PARTIAL_RETRIES)."
+                fi
+              fi
+
+              {
+                echo "#### $label (status $status)"
+                echo
+                echo '```json'
+                echo "$body"
+                echo '```'
+                echo
+              } >> "$GITHUB_STEP_SUMMARY"
+              break
+            done
+          }
+          BASH
+          echo "Helpers listos."
+
+      - name: Update last candle (ingest EOD)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source helpers.sh
+
+          URL="$BACKEND_BASE/internal/market/update-last-candle"
+
+          case "$INGEST_STRATEGY" in
+            global_once)
+              echo "===> [update-last-candle:GLOBAL] (experimental)"
+              # Requiere que el backend soporte 'ingest_all' (ignora universe y trae todo con grouped)
+              PAYLOAD="{\"universe_mode\":\"sp100\",\"ingest_all\":true,\"backfill_days\":${BACKFILL_DAYS},\"auto_backfill\":${BACKFILL_AUTO},\"auto_mode\":\"${BACKFILL_MODE}\"}"
+              loop_until_not_partial "$URL" "$PAYLOAD" "update-last-candle:GLOBAL"
+              ;;
+            *)
+              IFS=',' read -ra MODES <<< "$UNIVERSE_LIST"
+              for MODE in "${MODES[@]}"; do
+                MODE_TRIM="$(echo "$MODE" | xargs)"
+                PAYLOAD="{\"universe_mode\":\"$MODE_TRIM\",\"backfill_days\":${BACKFILL_DAYS},\"auto_backfill\":${BACKFILL_AUTO},\"auto_mode\":\"${BACKFILL_MODE}\"}"
+                loop_until_not_partial "$URL" "$PAYLOAD" "update-last-candle:$MODE_TRIM"
+                # Respetar ventana RPM entre universos
+                sleep_secs=$(( ${SLEEP_BETWEEN_UNIVERSES} + (RANDOM % 3) ))
+                echo "sleep ${sleep_secs} s (after $MODE_TRIM)"; sleep "${sleep_secs}"
+              done
+              ;;
+          esac
+
+      - name: Espera breve antes de precalc
+        shell: bash
+        run: |
+          echo "sleep $SLEEP_BETWEEN_STEPS s (antes de precalc)"; sleep "$SLEEP_BETWEEN_STEPS"
+
+      - name: Precalc indicators & signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          source helpers.sh
+          URL="$BACKEND_BASE/internal/market/precalc"
+
+          if [ "$INGEST_STRATEGY" = "global_once" ]; then
+            # Si ya ingeriste global, igual precalculá por universo para distribuir carga
+            :
+          fi
+
+          IFS=',' read -ra MODES <<< "$UNIVERSE_LIST"
+          for MODE in "${MODES[@]}"; do
+            MODE_TRIM="$(echo "$MODE" | xargs)"
+            PAYLOAD="{\"universe_mode\":\"$MODE_TRIM\"}"
+            loop_until_not_partial "$URL" "$PAYLOAD" "precalc:$MODE_TRIM"
+            sleep_secs=$(( ${SLEEP_BETWEEN_UNIVERSES} + (RANDOM % 3) ))
+            echo "sleep ${sleep_secs} s (after $MODE_TRIM)"; sleep "${sleep_secs}"
+          done
+
+      - name: Espera breve antes de forecasts
+        shell: bash
+        run: |
+          echo "sleep $SLEEP_BETWEEN_STEPS s (antes de forecasts)"; sleep "$SLEEP_BETWEEN_STEPS"
+
+      - name: Precompute forecasts (daily kickoff, 202 esperado)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$BACKEND_BASE/api/forecasting/internal/forecast/precompute"
+          PAYLOAD='{"model_name":"rf","skip_if_unchanged":true,"sleep":0.1}'
+
+          attempts=8
+          for i in $(seq 1 $attempts); do
+            echo "===> KICKOFF forecasts intento $i/$attempts"
+            code=$(curl -sS -o /tmp/forecast_kickoff.json -w "%{http_code}" \
+                     -X POST "$URL" \
+                     -H "Content-Type: application/json" \
+                     -H "X-Internal-Token: $INTERNAL_API_TOKEN" \
+                     --data "$PAYLOAD" || true)
+            if [ "$code" = "202" ] || [ "$code" = "200" ]; then
+              echo "Forecast OK (HTTP $code)"
+              break
+            fi
+            sleep_secs=$(( 10 + i + (RANDOM % 5) ))
+            echo "Forecast HTTP $code → retry en $sleep_secs s"; sleep "$sleep_secs"
+            if [ "$i" = "$attempts" ]; then
+              echo "Forecasts: agotados los reintentos" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "#### forecasts:kickoff (status 202 esperado)"
+            echo
+            echo '```json'
+            cat /tmp/forecast_kickoff.json || true
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  weekly_fundamentals:
+    name: Weekly fundamentals (Finnhub)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: market-weekly-fundamentals
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '30 03 * * 2')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.task == 'fundamentals')
+
+    steps:
+      - name: Contexto
+        shell: bash
+        run: |
+          echo "UTC now:" && date -u
+          echo "BACKEND_BASE=$BACKEND_BASE"
+          echo "UNIVERSE_LIST=$UNIVERSE_LIST"
+          echo "METRICS=$METRICS"
+
+      - name: Helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > helpers.sh <<'BASH'
+          set -euo pipefail
+          post_json () {
+            local resp status body
+            resp="$(curl -sS -X POST "$1" \
+                     -H "Content-Type: application/json" \
+                     -H "X-Internal-Token: $INTERNAL_API_TOKEN" \
+                     --data "$2" \
+                     -w "\n%{http_code}")" || true
+            status="$(echo "$resp" | tail -n1)"
+            body="$(echo "$resp" | sed '$d')"
+            printf "%s\n---HTTP-STATUS---%s" "$body" "$status"
+          }
+          BASH
+
+      - name: Sync fundamentals (quarterly) — todos los universos
+        shell: bash
+        run: |
+          set -euo pipefail
+          source helpers.sh
+          IFS=',' read -ra MODES <<< "$UNIVERSE_LIST"
+          for MODE in "${MODES[@]}"; do
+            MODE_TRIM="$(echo "$MODE" | xargs)"
+            URL="$BACKEND_BASE/internal/company/sync-fundamentals"
+            if [ -n "${{ github.event.inputs.metrics }}" ]; then
+              PAYLOAD="{\"universe_mode\":\"$MODE_TRIM\",\"metrics\":\"${{ github.event.inputs.metrics }}\"}"
+            else
+              PAYLOAD="{\"universe_mode\":\"$MODE_TRIM\"}"
+            fi
+            echo "===> [$MODE_TRIM] POST $URL payload=$PAYLOAD"
+            out="$(post_json "$URL" "$PAYLOAD")"
+            status="$(echo "$out" | sed -n '$p' | sed 's/---HTTP-STATUS---//')"
+            body="$(echo "$out" | sed '$d')"
+            echo "$body"
+            {
+              echo "#### fundamentals:$MODE_TRIM (status $status)"
+              echo
+              echo '```json'
+              echo "$body"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            sleep_secs=$(( ${SLEEP_BETWEEN_UNIVERSES} + (RANDOM % 3) ))
+            echo "sleep ${sleep_secs} s (after $MODE_TRIM)"; sleep "${sleep_secs}"
+          done
+
+  monthly_company_profile:
+    name: Monthly company profile sync
+    runs-on: ubuntu-latest
+    concurrency:
+      group: market-monthly-profiles
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '30 03 1 * *')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.task == 'profiles')
+
+    steps:
+      - name: Contexto
+        shell: bash
+        run: |
+          echo "UTC now:" && date -u
+          echo "BACKEND_BASE=$BACKEND_BASE"
+          echo "UNIVERSE_LIST=$UNIVERSE_LIST"
+
+      - name: Helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > helpers.sh <<'BASH'
+          set -euo pipefail
+          post_json () {
+            local resp status body
+            resp="$(curl -sS -X POST "$1" \
+                     -H "Content-Type: application/json" \
+                     -H "X-Internal-Token: $INTERNAL_API_TOKEN" \
+                     --data "$2" \
+                     -w "\n%{http_code}")" || true
+            status="$(echo "$resp" | tail -n1)"
+            body="$(echo "$resp" | sed '$d')"
+            printf "%s\n---HTTP-STATUS---%s" "$body" "$status"
+          }
+          BASH
+
+      - name: Sync company profile (todos los universos)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source helpers.sh
+          IFS=',' read -ra MODES <<< "$UNIVERSE_LIST"
+          for MODE in "${MODES[@]}"; do
+            MODE_TRIM="$(echo "$MODE" | xargs)"
+            URL="$BACKEND_BASE/internal/company/sync-profile"
+            PAYLOAD="{\"universe_mode\":\"$MODE_TRIM\"}"
+            echo "===> [$MODE_TRIM] POST $URL payload=$PAYLOAD"
+            out="$(post_json "$URL" "$PAYLOAD")"
+            status="$(echo "$out" | sed -n '$p' | sed 's/---HTTP-STATUS---//')"
+            body="$(echo "$out" | sed '$d')"
+            echo "$body"
+            {
+              echo "#### profiles:$MODE_TRIM (status $status)"
+              echo
+              echo '```json'
+              echo "$body"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            sleep_secs=$(( ${SLEEP_BETWEEN_UNIVERSES} + (RANDOM % 3) ))
+            echo "sleep ${sleep_secs} s (after $MODE_TRIM)"; sleep "${sleep_secs}"
+          done
+
+
+

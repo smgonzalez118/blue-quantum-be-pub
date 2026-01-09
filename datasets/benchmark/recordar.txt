@@ -1,0 +1,1 @@
+El SP500 lo bajamos como "SPY" desde Polygon.
